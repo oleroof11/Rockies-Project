@@ -1,0 +1,328 @@
+---
+title: "Rockies-Project"
+author: "Ole Roof"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r knitr-options, include = FALSE}
+knitr::opts_chunk$set(fig.align="center",
+                      warning = FALSE,
+                      message = FALSE,
+                      comment = NA)
+```
+
+```{r libs, include=FALSE}
+library(tidyverse)
+library(Lahman)
+library(baseballr)
+library(lubridate)
+library(scales)
+library(gganimate)
+library(fuzzyjoin)
+library(mgcv)
+theme_set(theme_bw())
+```
+
+# June 29th game; Los Angeles Dodgers vs. Colorado Rockies
+## Rockies Win, 5-3
+```{r}
+df_col_lad <- scrape_statcast_savant(start_date = ymd("2019-06-29"), 
+                                   end_date = ymd("2019-06-29"))
+
+df_col_lad <- df_col_lad %>%
+  filter(., home_team == "COL", away_team == "LAD")
+
+score <- matrix(c(1,0,0,1,1,0,0,0,0,3,8,1,0,0,2,0,0,3,0,0,"X",5,7,1),ncol=12,byrow=TRUE)
+colnames(score) <- c("1","2","3","4","5","6","7","8","9","R","H","E")
+rownames(score) <- c("Los Angeles Dodgers","Colorado Rockies")
+score <- as.table(score)
+knitr::kable(score)
+```
+
+# Box Score
+
+```{r}
+url_base <- "http://gd2.mlb.com/components/game/mlb/"
+url <- paste0(url_base, 
+  "year_2019/month_06/day_29/gid_2019_06_29_lanmlb_colmlb_1/boxscore.xml")
+box_score <- baseballr::batter_boxscore(url)
+knitr::kable(box_score)
+```
+
+# Standings
+
+```{r}
+knitr::kable(standings_on_date_bref("2019-06-29", "NL West", from = FALSE))
+```
+
+# Strike Zone
+
+```{r}
+top_zone <- 3.5
+bot_zone <- 1.6
+left_zone <- -0.75
+right_zone <- 0.75
+strike_zone_df <- data.frame(
+  x = c(left_zone, left_zone, right_zone, right_zone, left_zone),
+  y = c(bot_zone, top_zone, top_zone, bot_zone, bot_zone)
+)
+```
+
+# How did umpires call balls and strikes?
+
+```{r}
+nolan_id <- playerid_lookup(last_name = "Arenado", first_name = "Nolan") %>%
+  dplyr::pull(., mlbam_id)
+
+df_nolan_bat <- scrape_statcast_savant(start_date = ymd("2019-06-27"), 
+                                       end_date = ymd("2019-06-30"), 
+                                       playerid = nolan_id)
+
+df_nolan_bat <- df_nolan_bat %>%
+  mutate(swing = if_else(description %in% c("ball", "blocked_ball",
+                                            "automatic_ball", "called_strike",
+                                            "hit_by_pitch"), 0 , 1))
+
+p <- df_nolan_bat %>%
+  filter(swing == "0", type != "X") %>%
+  ggplot(aes(., x = plate_x, y = plate_z, col = type))
+
+p + geom_point(alpha = 0.5) +
+  scale_color_brewer("call", palette = "Set1") +
+  geom_path(data = strike_zone_df,aes(x, y), lwd = 1, color = "black") +
+  labs(caption = "Data courtesy of MLBAM",
+       x = "horizontal location (ft)",
+       y = "vertical location (ft)") +
+  xlim(-3.5, 3.5) +
+  coord_fixed()
+```
+
+# Nolan's Swing Probability
+
+```{r}
+swing_gam1 <- gam(swing ~ s(plate_x) + s(plate_z),
+                 family = binomial,
+                 data = df_nolan_bat)
+
+
+x <- seq(-1.5, 1.5, length = 50)
+z <- seq(0.5, 5, length = 50)
+swing_predict_data1 <- tibble(plate_x = c(outer(x, z * 0 + 1)),
+                             plate_z = c(outer(x * 0 + 1, z)))
+
+
+swing_preds1 <- predict(swing_gam1, newdata = swing_predict_data1, type = "response")
+swing_predict_data1 <- swing_predict_data1 %>%
+  mutate(., swing_prob1 = swing_preds1)
+
+p <- ggplot(data = swing_predict_data1,
+            aes(x = plate_x, y = plate_z))
+
+p + geom_tile(aes(fill = swing_prob1)) +
+  scale_fill_distiller("", palette = "Spectral",
+                       direction = -1,
+                       limit = c(0,1)) +
+  geom_path(data = strike_zone_df, aes(x, y),
+            linetype = 2, color = "navy") +
+  coord_fixed() +
+  labs(x = "horizontal location (ft)",
+       y = "vertical location (ft)",
+       caption = "Data courtesy of MLBAM",
+       title = "When Does Nolan Arenado Swing?")
+```
+
+
+# Daily Stat Function
+## While the baseball savant data has a ton of information, it does not have stats per game or cumulative stats for the season
+
+```{r}
+savant_daily <- function(data){
+  output <- data %>% 
+    filter(!is.na(events), events != "caught_stealing_2b") %>% 
+    mutate(
+      is_ab = if_else(
+        events %in% c("strikeout", "field_out", "single", "double", "force_out", 
+                      "triple", "home_run", "double_play", "field_error", "grounded_into_double_play",
+                      "strikeout_double_play", "fielders_choice_out"),
+        TRUE,
+        FALSE
+      ),
+      is_hit = if_else(
+        events %in% c("single", "double", "triple", "home_run"), TRUE, FALSE
+      ),
+      bases = case_when(
+        events == "single" ~ 1,
+        events == "double" ~ 2,
+        events == "triple" ~ 3,
+        events == "home_run" ~ 4,
+        TRUE ~ 0
+      ),
+      event_custom = case_when(
+        events %in% c("single", "double", "triple", "home_run") ~ events, 
+        str_detect(events, "sac") ~ "sacrifice",
+        events %in% c("walk", "hit_by_pitch") ~ NA_character_,
+        events == "field_error" ~ "error",
+        TRUE ~ "out"
+      )
+    ) %>% 
+    group_by(game_date) %>% 
+    summarize(
+      pa = length(unique(at_bat_number)),
+      ab = sum(is_ab),
+      hits = sum(is_hit),
+      doubles = sum(events == "double"),
+      triples = sum(events == "triples"),
+      home_runs = sum(events == "home_run"),
+      bb = sum(events == "walk"),
+      hbp = sum(events == "hit_by_pitch"),
+      so = sum(events %in% c("strikeout", "strikeout_double_play")),
+      bases = sum(bases)
+    ) %>% 
+    arrange(game_date) %>% 
+    mutate(
+      ba = round(hits/ab, 3),
+      obp = round((hits + bb + hbp)/(ab + bb + hbp), 3),
+      slg = round(bases/ab, 3),
+      ops = obp + slg,
+      hits_to_date = cumsum(hits),
+      bb_to_date = cumsum(bb),
+      hbp_to_date = cumsum(hbp),
+      ab_to_date = cumsum(ab),
+      bases_to_date = cumsum(bases),
+      ba_to_date = round(hits_to_date/ab_to_date, 3),
+      obp_to_date = round(
+        (hits_to_date + bb_to_date + hbp_to_date)/(ab_to_date + bb_to_date + hbp_to_date), 3
+      ),
+      slg_to_date = round(bases_to_date/ab_to_date, 3),
+      ops_to_date = obp_to_date + slg_to_date
+    )
+  
+  return(output)
+}
+```
+
+```{r}
+charlie_id <- playerid_lookup(last_name = "Blackmon", first_name = "Charlie") %>%
+  dplyr::pull(., mlbam_id)
+df_charlie_bat <- scrape_statcast_savant(start_date = "2019-03-28", 
+                                       end_date = "2019-06-29", 
+                                       playerid = charlie_id)
+charlie_bsvnt_daily <- savant_daily(df_charlie_bat)
+
+knitr::kable(charlie_bsvnt_daily)
+```
+
+# Charlie Blackmon Batting Average
+
+```{r}
+charlie_rbi <- charlie_bsvnt_daily %>% 
+  ggplot(aes(game_date, ba_to_date)) + 
+  geom_step(size = 1.5) + 
+  theme_bw() + 
+  labs(
+    y = "Batting Average",
+    title = "Charlie Blackmon's batting average during the 2019 season",
+    caption = "Data source: baseballsavant.com\n"
+  ) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%B %d, %Y") + 
+  scale_y_continuous(breaks = seq(0, 0.35, 0.05)) + 
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.caption = element_text(size = 10, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold")
+  ) + 
+  transition_reveal(id = game_date, along = game_date) 
+
+
+animate(charlie_rbi, width = 800, height = 600)
+```
+
+
+# Charlie Blackmon Spray Chart
+
+```{r}
+charlie_spray <- df_charlie_bat %>% 
+  filter(events %in% c("single", "double", "triple", "home_run")) %>% 
+  mutate(events = factor(events, levels = c("single", "double", "triple", "home_run"),
+                         labels = c("Single", "Double", "Triple", "Home Run"))) %>% 
+  ggspraychart(fill_value = "events", 
+               fill_palette = c("Single"="red", "Double"="blue", 
+                                "Triple"="yellow", "Home Run"="green"), point_alpha = 0.5) +
+  ggtitle("Charlie Blackmon\n") +
+  labs(subtitle = "Spray Chart for 2019\n") + 
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(size = 14),
+    plot.caption = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 12, face = "bold")
+  )
+charlie_spray
+```
+
+```{r}
+charlie_spray_density <- df_charlie_bat %>% 
+  filter(events %in% c("single", "double", "triple", "home_run")) %>% 
+  mutate(events = factor(events, levels = c("single", "double", "triple", "home_run"),
+                         labels = c("Single", "Double", "Triple", "Home Run"))) %>% 
+  ggspraychart(fill_value = "events", 
+               fill_palette = c("Single"="red", "Double"="blue", 
+                                "Triple"="yellow", "Home Run"="green"), density = TRUE) +
+  ggtitle("Charlie Blackmon\n") +
+  labs(subtitle = "Spray Chart for 2019\n") + 
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(size = 14),
+    plot.caption = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 12, face = "bold")
+  )
+charlie_spray_density
+```
+
+# Clayton Kershaw
+
+```{r}
+kersh_id <- playerid_lookup(last_name = "Kershaw", first_name = "Clayton")
+df_kersh <- scrape_statcast_savant_pitcher(start_date = ymd("2019-06-29"), 
+                                          end_date = ymd("2019-06-29"), 
+                                          pitcherid = 477132)
+df_kersh_grouped <- df_kersh %>%
+  group_by(pitch_type) %>%
+  summarize(perc = n()/nrow(df_kersh)) %>%
+  arrange(desc(-perc)) %>%
+  mutate(pitch_type = factor(pitch_type, pitch_type))
+
+p <- ggplot(df_kersh_grouped %>% filter(pitch_type != "null"), 
+            aes(x = pitch_type, y = perc))
+p + geom_bar(stat = "identity", fill = "#6e0000") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(x = "pitch type",
+       y = "percentage")
+```
+
+```{r}
+p <- ggplot(df_kersh %>%
+              filter(type != "X"),
+            aes(x = plate_x,
+                y = plate_z, col = type))
+p + geom_point(alpha = 0.4) +
+  facet_wrap(. ~ pitch_type, ncol = 2) +
+  scale_color_brewer("type", palette = "Set1") +
+  geom_path(data = strike_zone_df,aes(x, y), lwd = 1.5, color = "red") +
+  labs(title = "Pitches Throw by Clayton Kershaw", 
+       caption = "Data courtesy of MLBAM",
+       x = "horizontal location (ft)",
+       y = "vertical location (ft)") +
+  xlim(-3.5, 3.5) +
+  coord_fixed()
+```
+
